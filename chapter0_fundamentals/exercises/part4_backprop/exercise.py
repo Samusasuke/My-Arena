@@ -538,3 +538,4 @@ print([name_lookup[t] for t in sorted_computational_graph(d)])
 # %%
 
 # %%
+oo

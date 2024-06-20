@@ -118,7 +118,7 @@ class BackwardFuncLookup:
         self.map.setdefault(forward_fn, {}).__setitem__(arg_position, back_fn)
 
     def get_back_func(self, forward_fn: Callable, arg_position: int) -> Callable:
-        return self.map[forward_fn][arg_position]
+        return self.map.setdefault(forward_fn, {}).__getitem__(arg_position)
 
 
 BACK_FUNCS = BackwardFuncLookup()
@@ -199,6 +199,7 @@ class Tensor:
         return multiply(other, self)
 
     def __truediv__(self, other) -> "Tensor":
+        print(self, other)
         return true_divide(self, other)
 
     def __rtruediv__(self, other) -> "Tensor":
@@ -321,7 +322,6 @@ def log_forward(x: Tensor) -> Tensor:
     requires_grad = x.requires_grad and grad_tracking_enabled
     ans = Tensor(np.log(x.array), requires_grad)
     if requires_grad:
-        ans.grad = np.zeros_like(x.array)
         ans.recipe = Recipe(np.log, (x.array,), {}, {0:x})
     return ans
 log = log_forward
@@ -348,12 +348,11 @@ def multiply_forward(a: Union[Tensor, int], b: Union[Tensor, int]) -> Tensor:
     if isinstance(b, Tensor):
         b_val = b.array
         requires_grad |= b.requires_grad
-        grad = np.zeros_like(b_val)
+
     
     requires_grad &= grad_tracking_enabled
     res = Tensor(a_val*b_val, requires_grad)
     if requires_grad:
-        res.grad = grad
         parents = { i:arg for (i,arg) in zip(range(2), (a,b)) if isinstance(arg, Tensor) }
         res.recipe = Recipe(np.multiply, (a_val, b_val), {}, parents)
     return res
@@ -407,7 +406,6 @@ def wrap_forward_fn(numpy_func: Callable, is_differentiable=True) -> Callable:
         res = numpy_func(*inner_args, **kwargs)
         ans = Tensor(res, requires_grad)
         if requires_grad:
-            ans.grad = np.zeros_like(res)
             ans.recipe = Recipe(numpy_func, inner_args, kwargs, parents)
         return ans
         # prepare inner args
@@ -484,7 +482,7 @@ def topological_sort(node: Node, get_children: Callable) -> List[Node]:
                 popping = False
         if popping:
             res[parent] = None
-            stack.popitem(parent)
+            stack.popitem()
     return list(res)
         
 edges = {'a':['b','c'],
@@ -538,4 +536,81 @@ print([name_lookup[t] for t in sorted_computational_graph(d)])
 # %%
 
 # %%
-oo
+def backprop(end_node: Tensor, end_grad: Optional[Tensor] = None) -> None:
+    '''Accumulates gradients in the grad field of each leaf node.
+
+    tensor.backward() is equivalent to backprop(tensor).
+
+    end_node: 
+        The rightmost node in the computation graph. 
+        If it contains more than one element, end_grad must be provided.
+    end_grad: 
+        A tensor of the same shape as end_node. 
+        Set to 1 if not specified and end_node has only one element.
+    '''
+    pass
+# %%
+def backprop(end_node: Tensor, end_grad: Optional[Tensor] = None) -> None:
+    '''Accumulates gradients in the grad field of each leaf node.
+
+    tensor.backward() is equivalent to backprop(tensor).
+
+    end_node: 
+        The rightmost node in the computation graph. 
+        If it contains more than one element, end_grad must be provided.
+    end_grad: 
+        A tensor of the same shape as end_node. 
+        Set to 1 if not specified and end_node has only one element.
+    '''
+    # SOLUTION
+
+    # Get value of end_grad_arr
+    end_grad_arr = np.ones_like(end_node.array) if end_grad is None else end_grad.array
+
+    # Create dict to store gradients
+    grads: Dict[Tensor, Arr] = {end_node: end_grad_arr}
+
+    # Iterate through the computational graph, using your sorting function
+    for node in sorted_computational_graph(end_node):
+
+        # Get the outgradient from the grads dict
+        outgrad = grads.pop(node)
+        # We only store the gradients if this node is a leaf & requires_grad is true
+        if node.is_leaf and node.requires_grad:
+            # Add the gradient to this node's grad (need to deal with special case grad=None)
+            if node.grad is None:
+                node.grad = Tensor(outgrad)
+            else:
+                node.grad.array += outgrad
+
+        # If node has no parents, then the backtracking through the computational
+        # graph ends here
+        if node.recipe is None or node.recipe.parents is None:
+            continue
+
+        # If node has a recipe, then we iterate through parents (which is a dict of {arg_posn: tensor})
+        for argnum, parent in node.recipe.parents.items():
+
+            # Get the backward function corresponding to the function that created this node
+            back_fn = BACK_FUNCS.get_back_func(node.recipe.func, argnum)
+
+            # Use this backward function to calculate the gradient
+            in_grad = back_fn(outgrad, node.array, *node.recipe.args, **node.recipe.kwargs)
+
+            # Add the gradient to this node in the dictionary `grads`
+            # Note that we only set node.grad (from the grads dict) in the code block above
+            if parent not in grads:
+                grads[parent] = in_grad
+            else:
+                grads[parent] += in_grad
+
+#%%
+
+tests.test_backprop(Tensor)
+tests.test_backprop_branching(Tensor)
+tests.test_backprop_requires_grad_false(Tensor)
+tests.test_backprop_float_arg(Tensor)
+tests.test_backprop_shared_parent(Tensor)
+
+#%%
+

@@ -417,6 +417,8 @@ def test_sweep_config(sweep_config):
         assert k in sweep_config_parameters_expected, f"Unexpected parameter in sweep config: {k}"
         assert isinstance(v, dict), f"Values for parameter {k} should be a dictionary"
         if "values" in v: v["values"] = list(v["values"])
+        # print(v)
+        # print(sweep_config_parameters_expected[k])
         assert v in sweep_config_parameters_expected[k], f"Unexpected values for parameter {k}: {v}"
 
     for k, v in sweep_config_parameters_expected.items():

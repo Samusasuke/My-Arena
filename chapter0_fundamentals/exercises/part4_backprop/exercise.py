@@ -403,6 +403,7 @@ def wrap_forward_fn(numpy_func: Callable, is_differentiable=True) -> Callable:
                 val = arg
             inner_args.append(val)
         requires_grad &= grad_tracking_enabled
+        requires_grad &= is_differentiable
         res = numpy_func(*inner_args, **kwargs)
         ans = Tensor(res, requires_grad)
         if requires_grad:
@@ -614,3 +615,133 @@ tests.test_backprop_shared_parent(Tensor)
 
 #%%
 
+def _argmax(x: Arr, dim=None, keepdim=False):
+    '''Like torch.argmax.'''
+    return np.expand_dims(np.argmax(x, axis=dim), axis=([] if dim is None else dim))
+
+
+
+argmax = wrap_forward_fn(_argmax, is_differentiable=False)
+
+a = Tensor([1.0, 0.0, 3.0, 4.0], requires_grad=True)
+b = a.argmax()
+assert not b.requires_grad
+assert b.recipe is None
+assert b.item() == 3
+# %%
+def negative_back(grad_out: Arr, out: Arr, x: Arr) -> Arr:
+    '''Backward function for f(x) = -x elementwise.'''
+    return -grad_out
+
+
+negative = wrap_forward_fn(np.negative)
+BACK_FUNCS.add_back_func(np.negative, 0, negative_back)
+
+tests.test_negative_back(Tensor)
+# %%
+def exp_back(grad_out: Arr, out: Arr, x: Arr) -> Arr:
+    return grad_out * out
+
+
+exp = wrap_forward_fn(np.exp)
+BACK_FUNCS.add_back_func(np.exp, 0, exp_back)
+
+tests.test_exp_back(Tensor)
+# %%
+def reshape_back(grad_out: Arr, out: Arr, x: Arr, new_shape: tuple) -> Arr:
+    return grad_out.reshape(x.shape)
+
+
+reshape = wrap_forward_fn(np.reshape)
+BACK_FUNCS.add_back_func(np.reshape, 0, reshape_back)
+
+tests.test_reshape_back(Tensor)
+# %%
+def invert_transposition(axes: tuple) -> tuple:
+    '''
+    axes: tuple indicating a transition
+
+    Returns: inverse of this transposition, i.e. the array `axes_inv` s.t. we have:
+        np.transpose(np.transpose(x, axes), axes_inv) == x
+
+    Some examples:
+        (1, 0)    --> (1, 0)     # this is reversing a simple 2-element transposition
+        (0, 2, 1) --> (0, 1, 2)
+        (1, 2, 0) --> (2, 0, 1)  # this is reversing the order of a 3-cycle
+    '''
+    ans = list(0 for _ in range(len(axes)))
+    for i,f_i in enumerate(axes):
+        ans[f_i] = i
+    return tuple(ans)
+
+def permute_back(grad_out: Arr, out: Arr, x: Arr, axes: tuple) -> Arr:
+    return np.transpose(grad_out, invert_transposition(axes))
+
+ 
+
+BACK_FUNCS.add_back_func(np.transpose, 0, permute_back)
+permute = wrap_forward_fn(np.transpose)
+
+tests.test_permute_back(Tensor)
+# %%
+def expand_back(grad_out: Arr, out: Arr, x: Arr, new_shape: tuple) -> Arr:
+    return unbroadcast(grad_out, x)
+
+def _expand(x: Arr, new_shape) -> Arr:
+    '''
+    Like torch.expand, calling np.broadcast_to internally.
+
+    Note torch.expand supports -1 for a dimension size meaning "don't change the size".
+    np.broadcast_to does not natively support this.
+    '''
+    old_shape =  x.shape
+
+    delta = len(new_shape) - len(old_shape)
+
+    end_shape = [
+        (l if l!= -1 else old_shape[i-delta])
+          for i,l in enumerate(new_shape)]
+    
+    return np.broadcast_to(x,tuple(end_shape))
+
+expand = wrap_forward_fn(_expand)
+BACK_FUNCS.add_back_func(_expand, 0, expand_back)
+
+tests.test_expand(Tensor)
+tests.test_expand_negative_length(Tensor)
+# %%
+def sum_back(grad_out: Arr, out: Arr, x: Arr, dim=None, keepdim=False):
+    '''Basic idea: repeat grad_out over the dims along which x was summed'''
+    
+    assert out.shape == grad_out.shape
+    if dim is None:
+        dim = tuple(range(x.ndim))
+    if isinstance(dim, int):
+        dim = (dim,)
+    # print(f'x.shape = {x.shape}, dim = {dim}, out.shape = {out.shape}')
+    og_dims = OrderedDict( (d,l) for d, l in enumerate(x.shape))
+    
+    if keepdim:
+        lost_dims = OrderedDict()
+    else:
+        lost_dims = OrderedDict((d,og_dims[d]) for d in dim)
+    
+    kept_dims = OrderedDict((d,og_dims[d]) for d in og_dims.keys() if d not in lost_dims.keys())
+    # print(f'og_dims = {og_dims}, lost = {lost_dims}, kept = {kept_dims}')
+
+    big = np.broadcast_to(grad_out, tuple(lost_dims.values())+tuple(kept_dims.values()))
+    perm = invert_transposition(tuple(lost_dims.keys())+tuple(kept_dims.keys()))
+    return np.transpose(big,perm)
+
+def _sum(x: Arr, dim=None, keepdim=False) -> Arr:
+    '''Like torch.sum, calling np.sum internally.'''
+    return np.sum(x, axis=dim, keepdims=keepdim)
+
+
+sum = wrap_forward_fn(_sum)
+BACK_FUNCS.add_back_func(_sum, 0, sum_back)
+
+tests.test_sum_keepdim_false(Tensor)
+tests.test_sum_keepdim_true(Tensor)
+tests.test_sum_dim_none(Tensor)
+# %%

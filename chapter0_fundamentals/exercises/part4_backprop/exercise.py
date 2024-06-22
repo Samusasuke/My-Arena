@@ -112,13 +112,13 @@ tests.test_forward_and_back(forward_and_back)
 
 class BackwardFuncLookup:
     def __init__(self) -> None:
-        self.map = {}
+        self.map = defaultdict(dict)
 
     def add_back_func(self, forward_fn: Callable, arg_position: int, back_fn: Callable) -> None:
-        self.map.setdefault(forward_fn, {}).__setitem__(arg_position, back_fn)
+        self.map[forward_fn].__setitem__(arg_position, back_fn)
 
     def get_back_func(self, forward_fn: Callable, arg_position: int) -> Callable:
-        return self.map.setdefault(forward_fn, {}).__getitem__(arg_position)
+        return self.map[forward_fn].__getitem__(arg_position)
 
 
 BACK_FUNCS = BackwardFuncLookup()
@@ -199,7 +199,6 @@ class Tensor:
         return multiply(other, self)
 
     def __truediv__(self, other) -> "Tensor":
-        print(self, other)
         return true_divide(self, other)
 
     def __rtruediv__(self, other) -> "Tensor":
@@ -744,4 +743,179 @@ BACK_FUNCS.add_back_func(_sum, 0, sum_back)
 tests.test_sum_keepdim_false(Tensor)
 tests.test_sum_keepdim_true(Tensor)
 tests.test_sum_dim_none(Tensor)
+# %%
+Index = Union[int, Tuple[int, ...], Tuple[Arr], Tuple[Tensor]]
+
+def coerce_index(index: Index) -> Union[int, Tuple[int, ...], Tuple[Arr]]:
+    '''
+    If index is of type signature `Tuple[Tensor]`, converts it to `Tuple[Arr]`.
+    '''
+    if isinstance(index, tuple) and isinstance(index[0], Tensor):
+        return tuple(t.array for t in index)
+    else:
+        return index
+
+def _getitem(x: Arr, index: Index) -> Arr:
+    '''Like x[index] when x is a torch.Tensor.'''
+    index = coerce_index(index)
+    return x[index]
+    pass
+
+def getitem_back(grad_out: Arr, out: Arr, x: Arr, index: Index):
+    '''
+    Backwards function for _getitem.
+
+    Hint: use np.add.at(a, indices, b)
+    This function works just like a[indices] += b, except that it allows for repeated indices.
+    '''
+    index = coerce_index(index)
+    ans = np.zeros_like(x)
+    np.add.at(ans, index, grad_out)
+    return ans
+
+getitem = wrap_forward_fn(_getitem)
+BACK_FUNCS.add_back_func(_getitem, 0, getitem_back)
+
+tests.test_coerce_index(coerce_index, Tensor)
+tests.test_getitem_int(Tensor)
+tests.test_getitem_tuple(Tensor)
+tests.test_getitem_integer_array(Tensor)
+tests.test_getitem_integer_tensor(Tensor)
+# %%
+add = wrap_forward_fn(np.add)
+subtract = wrap_forward_fn(np.subtract)
+true_divide = wrap_forward_fn(np.true_divide)
+
+
+class KeyBasedDefaultDict(defaultdict):
+    def __init__(self, default_factory=None, *args, **kwargs):
+        super().__init__(default_factory, *args, **kwargs)
+    
+    def __missing__(self, key):
+        if self.default_factory is None:
+            raise KeyError(key)
+        else:
+            # Provide a default value based on the key
+            self[key] = self.default_factory(key)
+            return self[key]
+        
+
+BACK_FUNCS.map[np.add] = KeyBasedDefaultDict(lambda index: (lambda grad_out, out, *args : unbroadcast(grad_out, args[index])))
+BACK_FUNCS.add_back_func(np.subtract, 0, lambda grad_out, out, x, y : unbroadcast(grad_out, x))
+BACK_FUNCS.add_back_func(np.subtract, 1, lambda grad_out, out, x, y : -unbroadcast(grad_out,y))
+BACK_FUNCS.add_back_func(np.true_divide, 0, lambda grad_out, out, x, y : unbroadcast(grad_out/np.broadcast_to(y,grad_out.shape),x))
+BACK_FUNCS.add_back_func(np.true_divide, 1, lambda grad_out, out, x, y : -unbroadcast(grad_out * out / y, y))
+
+
+
+tests.test_add_broadcasted(Tensor)
+tests.test_subtract_broadcasted(Tensor)
+tests.test_truedivide_broadcasted(Tensor)
+# %%
+def add_(x: Tensor, other: Tensor, alpha: float = 1.0) -> Tensor:
+    '''Like torch.add_. Compute x += other * alpha in-place and return tensor.'''
+    np.add(x.array, other.array * alpha, out=x.array)
+    return x
+
+
+def safe_example():
+    '''This example should work properly.'''
+    a = Tensor([0.0, 1.0, 2.0, 3.0], requires_grad=True)
+    b = Tensor([2.0, 3.0, 4.0, 5.0], requires_grad=True)
+    a.add_(b)
+    c = a * b
+    c.sum().backward()
+    assert a.grad is not None and np.allclose(a.grad.array, [2.0, 3.0, 4.0, 5.0])
+    assert b.grad is not None and np.allclose(b.grad.array, [2.0, 4.0, 6.0, 8.0])
+
+
+def unsafe_example():
+    '''This example is expected to compute the wrong gradients.'''
+    a = Tensor([0.0, 1.0, 2.0, 3.0], requires_grad=True)
+    b = Tensor([2.0, 3.0, 4.0, 5.0], requires_grad=True)
+    c = a * b
+    a.add_(b)
+    c.sum().backward()
+    if a.grad is not None and np.allclose(a.grad.array, [2.0, 3.0, 4.0, 5.0]):
+        print("Grad wrt a is OK!")
+    else:
+        print("Grad wrt a is WRONG!")
+    if b.grad is not None and np.allclose(b.grad.array, [0.0, 1.0, 2.0, 3.0]):
+        print("Grad wrt b is OK!")
+    else:
+        print("Grad wrt b is WRONG!")
+
+
+
+safe_example()
+unsafe_example()
+# %%
+a = Tensor([0, 1, 2, 3], requires_grad=True)
+(a * 2).sum().backward()
+b = Tensor([0, 1, 2, 3], requires_grad=True)
+(2 * b).sum().backward()
+assert a.grad is not None
+assert b.grad is not None
+assert np.allclose(a.grad.array, b.grad.array)
+# %%
+def maximum_back0(grad_out: Arr, out: Arr, x: Arr, y: Arr):
+    '''Backwards function for max(x, y) wrt x.'''
+    return unbroadcast(np.where(x>y, grad_out/2, 0) + np.where(x>=y, grad_out/2, 0),x)
+
+def maximum_back1(grad_out: Arr, out: Arr, x: Arr, y: Arr):
+    '''Backwards function for max(x, y) wrt y.'''
+    return unbroadcast(np.where(y>x, grad_out/2, 0) + np.where(y>=x, grad_out/2, 0),y)
+
+
+maximum = wrap_forward_fn(np.maximum)
+
+BACK_FUNCS.add_back_func(np.maximum, 0, maximum_back0)
+BACK_FUNCS.add_back_func(np.maximum, 1, maximum_back1)
+
+tests.test_maximum(Tensor)
+tests.test_maximum_broadcasted(Tensor)
+# %%
+def relu(x: Tensor) -> Tensor:
+    '''Like torch.nn.function.relu(x, inplace=False).'''
+    return maximum(x,0)
+
+
+tests.test_relu(Tensor)
+# %%
+def _matmul2d(x: Arr, y: Arr) -> Arr:
+    '''Matrix multiply restricted to the case where both inputs are exactly 2D.'''
+    return x @ y
+
+def matmul2d_back0(grad_out: Arr, out: Arr, x: Arr, y: Arr) -> Arr:
+    return unbroadcast(grad_out @ y.T, x)
+
+def matmul2d_back1(grad_out: Arr, out: Arr, x: Arr, y: Arr) -> Arr:
+    return unbroadcast(x.T @ grad_out, y)
+
+
+matmul = wrap_forward_fn(_matmul2d)
+BACK_FUNCS.add_back_func(_matmul2d, 0, matmul2d_back0)
+BACK_FUNCS.add_back_func(_matmul2d, 1, matmul2d_back1)
+
+tests.test_matmul2d(Tensor)
+# %%
+class Parameter(Tensor):
+    def __init__(self, tensor: Tensor, requires_grad=True):
+        '''Share the array with the provided tensor.'''
+        super().__init__(tensor.array, requires_grad)
+
+    def __repr__(self):
+        return "Parameter containing:\n" + super().__repr__()
+
+
+x = Tensor([1.0, 2.0, 3.0])
+p = Parameter(x)
+assert p.requires_grad
+assert p.array is x.array
+# print(repr(p))
+assert repr(p) == "Parameter containing:\nTensor(array([1., 2., 3.], dtype=float32), requires_grad=True)"
+x.add_(Tensor(np.array(2.0)))
+assert np.allclose(
+    p.array, np.array([3.0, 4.0, 5.0])
+), "in-place modifications to the original tensor should affect the parameter"
 # %%

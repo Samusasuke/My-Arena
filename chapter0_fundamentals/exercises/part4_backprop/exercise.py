@@ -919,3 +919,145 @@ assert np.allclose(
     p.array, np.array([3.0, 4.0, 5.0])
 ), "in-place modifications to the original tensor should affect the parameter"
 # %%
+
+class Module:
+    _modules: Dict[str, "Module"]
+    _parameters: Dict[str, Parameter]
+
+    def __init__(self):
+        self._modules = {}
+        self._parameters = {}
+
+    def modules(self):
+        '''Return the direct child modules of this module.'''
+        return self.__dict__["_modules"].values()
+
+    def parameters(self, recurse: bool = True) -> Iterator[Parameter]:
+        '''
+        Return an iterator over Module parameters.
+
+        recurse: if True, the iterator includes parameters of submodules, recursively.
+        '''
+        for par in self._parameters.values():
+            yield par
+        if recurse:
+            for mod in self._modules.values():
+                yield from mod.parameters(recurse)
+        return
+
+    
+    def __setattr__(self, key: str, val: Any) -> None:
+        '''
+        If val is a Parameter or Module, store it in the appropriate _parameters or _modules dict.
+        Otherwise, call __setattr__ from the superclass.
+        '''
+        if isinstance(val, Parameter):
+            self._parameters[key] = val
+        elif isinstance(val, Module):
+            self._modules[key] = val
+        else:
+            super().__setattr__(key,val)
+
+    def __getattr__(self, key: str) -> Union[Parameter, "Module"]:
+        '''
+        If key is in _parameters or _modules, return the corresponding value.
+        Otherwise, raise KeyError.
+        '''
+        if key in self._parameters.keys():
+            return self._parameters[key]
+        elif key in self._modules.keys():
+            return self._modules[key]
+        else:
+            raise KeyError
+
+    def __call__(self, *args, **kwargs):
+        return self.forward(*args, **kwargs)
+
+    def forward(self):
+        raise NotImplementedError("Subclasses must implement forward!")
+
+    def __repr__(self):
+        def _indent(s_, numSpaces):
+            return re.sub("\n", "\n" + (" " * numSpaces), s_)
+        lines = [f"({key}): {_indent(repr(module), 2)}" for key, module in self._modules.items()]
+        return "".join([
+            self.__class__.__name__ + "(",
+            "\n  " + "\n  ".join(lines) + "\n" if lines else "", ")"
+        ])
+
+
+class TestInnerModule(Module):
+    def __init__(self):
+        super().__init__()
+        self.param1 = Parameter(Tensor([1.0]))
+        self.param2 = Parameter(Tensor([2.0]))
+
+class TestModule(Module):
+    def __init__(self):
+        super().__init__()
+        self.inner = TestInnerModule()
+        self.param3 = Parameter(Tensor([3.0]))
+
+
+mod = TestModule()
+assert list(mod.modules()) == [mod.inner]
+assert list(mod.parameters()) == [
+    mod.param3,
+    mod.inner.param1,
+    mod.inner.param2,
+], "parameters should come before submodule parameters"
+print("Manually verify that the repr looks reasonable:")
+print(mod)
+# %%
+
+def initialize(shape, lim):
+    arr = np.random.uniform(-lim, lim, shape)
+    ten = Tensor(arr)
+    return Parameter(ten)
+
+class Linear(Module):
+    weight: Parameter
+    bias: Optional[Parameter]
+
+    def __init__(self, in_features: int, out_features: int, bias=True):
+        '''
+        A simple linear (technically, affine) transformation.
+
+        The fields should be named `weight` and `bias` for compatibility with PyTorch.
+        If `bias` is False, set `self.bias` to None.
+        '''
+        super().__init__()
+        self.weight = initialize((out_features,in_features), (in_features)**(-0.5))
+        self.bias = initialize((out_features, ),0)
+        if bias:
+            self.bias = initialize((out_features,), (in_features)**(-0.5))
+
+    def forward(self, x: Tensor) -> Tensor:
+        '''
+        x: shape (*, in_features)
+        Return: shape (*, out_features)
+        '''
+        bias = 0
+        if self.bias is not None:
+            bias = self.bias
+        return x @ self.weight.T + bias
+
+    def extra_repr(self) -> str:
+        # note, we need to use `self.bias is not None`, because `self.bias` is either a tensor or None, not bool
+        return f"in_features={self.in_features}, out_features={self.out_features}, bias={self.bias is not None}"
+
+
+
+linear = Linear(3, 4)
+assert isinstance(linear.weight, Tensor)
+assert linear.weight.requires_grad
+
+input = Tensor([[1.0, 2.0, 3.0]])
+output = linear(input)
+assert output.requires_grad
+
+expected_output = input @ linear.weight.T + linear.bias
+np.testing.assert_allclose(output.array, expected_output.array)
+
+print("All tests for `Linear` passed!")
+# %%

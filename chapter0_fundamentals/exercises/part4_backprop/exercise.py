@@ -238,13 +238,13 @@ class Tensor:
     def item(self):
         return self.array.item()
 
-    def sum(self, dim=None, keepdim=False):
+    def sum(self, dim=None, keepdim=False) -> "Tensor":
         return sum(self, dim=dim, keepdim=keepdim)
 
     def log(self):
         return log(self)
 
-    def exp(self):
+    def exp(self) -> "Tensor":
         return exp(self)
 
     def reshape(self, new_shape):
@@ -535,20 +535,6 @@ name_lookup = {a: "a", b: "b", c: "c", d: "d"}
 print([name_lookup[t] for t in sorted_computational_graph(d)])
 # %%
 
-# %%
-def backprop(end_node: Tensor, end_grad: Optional[Tensor] = None) -> None:
-    '''Accumulates gradients in the grad field of each leaf node.
-
-    tensor.backward() is equivalent to backprop(tensor).
-
-    end_node: 
-        The rightmost node in the computation graph. 
-        If it contains more than one element, end_grad must be provided.
-    end_grad: 
-        A tensor of the same shape as end_node. 
-        Set to 1 if not specified and end_node has only one element.
-    '''
-    pass
 # %%
 def backprop(end_node: Tensor, end_grad: Optional[Tensor] = None) -> None:
     '''Accumulates gradients in the grad field of each leaf node.
@@ -1060,4 +1046,140 @@ expected_output = input @ linear.weight.T + linear.bias
 np.testing.assert_allclose(output.array, expected_output.array)
 
 print("All tests for `Linear` passed!")
+#%%
+class ReLU(Module):
+    def forward(self, x: Tensor) -> Tensor:
+        return relu(x)
+    
+#%%
+class MLP(Module):
+    def __init__(self):
+        super().__init__()
+        self.linear1 = Linear(28 * 28, 64)
+        self.linear2 = Linear(64, 64)
+        self.relu1 = ReLU()
+        self.relu2 = ReLU()
+        self.output = Linear(64, 10)
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = x.reshape((x.shape[0], 28 * 28))
+        x = self.relu1(self.linear1(x))
+        x = self.relu2(self.linear2(x))
+        x = self.output(x)
+        return x
+# %%
+
+def cross_entropy(logits: Tensor, true_labels: Tensor) -> Tensor:
+    '''Like torch.nn.functional.cross_entropy with reduction='none'.
+
+    logits: shape (batch, classes)
+    true_labels: shape (batch,). Each element is the index of the correct label in the logits.
+
+    Return: shape (batch, ) containing the per-example loss.
+    '''
+    exp_logits = logits.exp()
+    probs = exp_logits / exp_logits.sum(dim = 1, keepdim = True)
+    return -probs[arange(0,probs.shape[0]), true_labels].log()
+
+
+tests.test_cross_entropy(Tensor, cross_entropy)
+# %%
+class NoGrad:
+    '''Context manager that disables grad inside the block. Like torch.no_grad.'''
+
+    was_enabled: bool
+
+    def __enter__(self):
+        '''
+        Method which is called whenever the context manager is entered, i.e. at the 
+        start of the `with NoGrad():` block.
+        '''
+        global grad_tracking_enabled
+        self.was_enabled = grad_tracking_enabled
+        grad_tracking_enabled = False
+
+    def __exit__(self, type, value, traceback):
+        '''
+        Method which is called whenever we exit the context manager.
+        '''
+        global grad_tracking_enabled
+        grad_tracking_enabled = self.was_enabled
+        pass
+# %%
+train_loader, test_loader = get_mnist()
+visualize(train_loader)
+# %%
+class SGD:
+    def __init__(self, params: Iterable[Parameter], lr: float):
+        '''Vanilla SGD with no additional features.'''
+        self.params = list(params)
+        self.lr = lr
+        self.b = [None for _ in self.params]
+
+    def zero_grad(self) -> None:
+        for p in self.params:
+            p.grad = None
+
+    def step(self) -> None:
+        with NoGrad():
+            for (i, p) in enumerate(self.params):
+                if not isinstance(p.grad,Tensor):
+                    print(p)
+                    print(p.grad)
+                assert isinstance(p.grad, Tensor)
+                p.add_(p.grad, -self.lr)
+
+
+def train(model: MLP, train_loader: DataLoader, optimizer: SGD, epoch: int, train_loss_list: Optional[list] = None):
+    print(f"Epoch: {epoch}")
+    progress_bar = tqdm(enumerate(train_loader))
+    for (batch_idx, (data, target)) in progress_bar:
+        data = Tensor(data.numpy())
+        target = Tensor(target.numpy())
+        optimizer.zero_grad()
+        output = model(data)
+        loss = cross_entropy(output, target).sum() / len(output)
+        loss.backward()
+        progress_bar.set_description(f"Train set: Avg loss: {loss.item():.3f}")
+        optimizer.step()
+        if train_loss_list is not None: train_loss_list.append(loss.item())
+
+
+def test(model: MLP, test_loader: DataLoader, test_loss_list: Optional[list] = None):
+    test_loss = 0
+    correct = 0
+    with NoGrad():
+        for (data, target) in test_loader:
+            data = Tensor(data.numpy())
+            target = Tensor(target.numpy())
+            output: Tensor = model(data)
+            test_loss += cross_entropy(output, target).sum().item()
+            pred = output.argmax(dim=1, keepdim=True)
+            correct += (pred == target.reshape(pred.shape)).sum().item()
+    test_loss /= len(test_loader.dataset)
+    print(f"Test set:  Avg loss: {test_loss:.4f}, Accuracy: {correct}/{len(test_loader.dataset)} ({correct / len(test_loader.dataset):.1%})")
+    if test_loss_list is not None: test_loss_list.append(test_loss)
+# %%
+
+num_epochs = 5
+model = MLP()
+start = time.time()
+train_loss_list = []
+test_loss_list = []
+optimizer = SGD(model.parameters(), 0.01)
+for epoch in range(num_epochs):
+    train(model, train_loader, optimizer, epoch, train_loss_list)
+    test(model, test_loader, test_loss_list)
+    optimizer.step()
+print(f"\nCompleted in {time.time() - start: .2f}s")
+
+line(
+    train_loss_list,
+    yaxis_range=[0, max(train_loss_list) + 0.1],
+    labels={"x": "Batches seen", "y": "Cross entropy loss"},
+    title="ConvNet training on MNIST",
+    width=800,
+    hovermode="x unified",
+    template="ggplot2", # alternative aesthetic for your plots (-:
+)
 # %%

@@ -40,4 +40,11 @@ else
     echo "requirements.txt file not found. Please ensure it exists in the current directory."
 fi
 
+if command -v code &> /dev/null
+then
+    code --install-extension ms-python.python
+    code --install-extension ms-toolsai.jupyter
+else
+    echo "VSCode command 'code' not found. Please ensure VSCode is installed and the 'code' command is available in your PATH."
+fi
 echo "Setup complete. The Python virtual environment 'ArenaEnv' is ready to use."

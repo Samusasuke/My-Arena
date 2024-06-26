@@ -94,7 +94,7 @@ class Tanh(nn.Module):
 tests.test_Tanh(Tanh)
 # %%
 class LeakyReLU(nn.Module):
-    def __init__(self, negative_slope: float = 0.01):
+    def __init__(self, negative_slope: float = 0.2):
         super().__init__()
         self.negative_slope = negative_slope
 
@@ -300,8 +300,230 @@ print_param_count(Discriminator(), solutions.DCGAN().netD)
 
 def initialize_weights(model: nn.Module) -> None:
     '''
-    Initializes weights according to the DCGAN paper, by modifying model weights in place.
+    Initializes weights according to the DCGAN paper (details at the end of
+    page 3), by modifying the weights of the model in place.
     '''
-    pass
-
+    for (name, module) in model.named_modules():
+        if any([
+            isinstance(module, Module)
+            for Module in [ConvTranspose2d, Conv2d, Linear]
+        ]):
+            nn.init.normal_(module.weight.data, 0.0, 0.02)
+        elif isinstance(module, BatchNorm2d):
+            nn.init.normal_(module.weight.data, 1.0, 0.02)
+            nn.init.constant_(module.bias.data, 0.0)
+            
 tests.test_initialize_weights(initialize_weights, ConvTranspose2d, Conv2d, Linear, BatchNorm2d)
+# %%
+from datasets import load_dataset
+
+# Load the dataset
+dataset = load_dataset("nielsr/CelebA-faces")
+print("Dataset loaded.")
+
+# Create path to save the data
+celeb_data_dir = section_dir / "data" / "celeba" / "img_align_celeba"
+if not celeb_data_dir.exists():
+    os.makedirs(celeb_data_dir)
+
+    # Iterate over the dataset and save each image
+    for idx, item in tqdm(enumerate(dataset["train"]), total=len(dataset["train"]), desc="Saving individual images..."):
+        # The image is already a JpegImageFile, so we can directly save it
+        item["image"].save(exercises_dir / "part5_gans_and_vaes" / "data" / "celeba" / "img_align_celeba" / f"{idx:06}.jpg")
+
+    print("All images have been saved.")
+# %%
+def get_dataset(dataset: Literal["MNIST", "CELEB"], train: bool = True) -> Dataset:
+    assert dataset in ["MNIST", "CELEB"]
+
+    if dataset == "CELEB":
+        image_size = 64
+        assert train, "CelebA dataset only has a training set"
+        transform = transforms.Compose([
+            transforms.Resize(image_size),
+            transforms.CenterCrop(image_size),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+        ])
+        trainset = datasets.ImageFolder(
+            root = exercises_dir / "part5_gans_and_vaes" / "data" / "celeba",
+            transform = transform
+        )
+
+    elif dataset == "MNIST":
+        img_size = 28
+        transform = transforms.Compose([
+            transforms.Resize(img_size),
+            transforms.ToTensor(),
+            transforms.Normalize((0.1307,), (0.3081,))
+        ])
+        trainset = datasets.MNIST(
+            root = exercises_dir / "part5_gans_and_vaes" / "data",
+            transform = transform,
+            download = True,
+        )
+
+    return trainset
+# %%
+def display_data(x: t.Tensor, nrows: int, title: str):
+    '''Displays a batch of data, using plotly.'''
+    # Reshape into the right shape for plotting (make it 2D if image is monochrome)
+    y = einops.rearrange(x, "(b1 b2) c h w -> (b1 h) (b2 w) c", b1=nrows).squeeze()
+    # Normalize, in the 0-1 range
+    y = (y - y.min()) / (y.max() - y.min())
+    # Display data
+    imshow(
+        y, binary_string=(y.ndim==2), height=50*(nrows+5),
+        title=title + f"<br>single input shape = {x[0].shape}"
+    )
+
+
+# Load in MNIST, get first batch from dataloader, and display
+trainset_mnist = get_dataset("MNIST")
+x = next(iter(DataLoader(trainset_mnist, batch_size=64)))[0]
+display_data(x, nrows=8, title="MNIST data")
+
+# Load in CelebA, get first batch from dataloader, and display
+trainset_celeb = get_dataset("CELEB")
+x = next(iter(DataLoader(trainset_celeb, batch_size=64)))[0]
+display_data(x, nrows=8, title="CalebA data")
+# %%
+
+@dataclass
+class DCGANArgs():
+    '''
+    Class for the arguments to the DCGAN (training and architecture).
+    Note, we use field(defaultfactory(...)) when our default value is a mutable object.
+    '''
+    latent_dim_size: int = 100
+    hidden_channels: List[int] = field(default_factory=lambda: [128, 256, 512])
+    dataset: Literal["MNIST", "CELEB"] = "CELEB"
+    batch_size: int = 64
+    epochs: int = 3
+    lr: float = 0.0002
+    betas: Tuple[float] = (0.5, 0.999)
+    seconds_between_eval: int = 10
+    wandb_project: Optional[str] = 'day5-gan'
+    wandb_name: Optional[str] = None
+
+
+class DCGANTrainer:
+    def __init__(self, args: DCGANArgs):
+        self.args = args
+
+        self.trainset = get_dataset(self.args.dataset)
+        self.trainloader = DataLoader(self.trainset, batch_size=args.batch_size, shuffle=True)
+
+        batch, img_channels, img_height, img_width = next(iter(self.trainloader))[0].shape
+        assert img_height == img_width
+
+        self.model = DCGAN(
+            args.latent_dim_size,
+            img_height,
+            img_channels,
+            args.hidden_channels,
+        ).to(device).train()
+
+        self.optG = t.optim.Adam(self.model.netG.parameters(), lr=args.lr, betas=args.betas)
+        self.optD = t.optim.Adam(self.model.netD.parameters(), lr=args.lr, betas=args.betas)
+
+
+    def training_step_discriminator(self, img_real: t.Tensor, img_fake: t.Tensor) -> t.Tensor:
+        '''
+        Generates a real and fake image, and performs a gradient step on the discriminator 
+        to maximize log(D(x)) + log(1-D(G(z))).
+        '''
+        self.optD.zero_grad()
+        D_x = self.model.netD(img_real)
+        D_G_z = self.model.netD(img_fake)
+        loss = t.log(D_x) + t.log(1-D_G_z)
+        loss.backward()
+        self.optD.step()
+        return loss
+
+    def training_step_generator(self, img_fake: t.Tensor) -> t.Tensor:
+        '''
+        Performs a gradient step on the generator to maximize log(D(G(z))).
+        '''
+        self.optG.zero_grad()
+        D_G_z = self.model.netD(img_fake)
+        loss = t.log(D_G_z)
+        loss.backward()
+        self.optG.step()
+        return loss
+    
+    @t.inference_mode()
+    def evaluate(self) -> None:
+        '''
+        Performs evaluation by generating 8 instances of random noise and passing them through
+        the generator, then logging the results to Weights & Biases.
+        '''
+        noise = t.randn(8, self.args.latent_dim_size)
+        self.model.netG.eval()
+        fake_images = self.model.netG(noise)
+        self.model.netG.train()
+        images = [wandb.image(img) for img in fake_images]
+        wandb.log({'images':images},step= self.step)
+
+
+    def train(self) -> None:
+        '''
+        Performs a full training run, while logging to Weights & Biases.
+        '''
+        self.step = 0
+        last_log_time = time.time()
+        wandb.init(project=self.args.wandb_project, name=self.args.wandb_name)
+        wandb.watch(self.model)
+
+        for epoch in range(self.args.epochs):
+
+            progress_bar = tqdm(self.trainloader, total=len(self.trainloader))
+
+            for (img_real, label) in progress_bar:
+
+                # Generate random noise & fake image
+                noise = t.randn(self.args.batch_size, self.args.latent_dim_size).to(device)
+                img_real = img_real.to(device)
+                img_fake = self.model.netG(noise)
+
+                # Training steps
+                lossD = self.training_step_discriminator(img_real, img_fake.detach())
+                lossG = self.training_step_generator(img_fake)
+
+                # Log data
+                wandb.log(dict(lossD=lossD, lossG=lossG), step=self.step)
+
+                # Update progress bar
+                self.step += img_real.shape[0]
+                progress_bar.set_description(f"{epoch=}, lossD={lossD:.4f}, lossG={lossG:.4f}, examples_seen={self.step}")
+
+                # Evaluate model on the same batch of random data
+                if time.time() - last_log_time > self.args.seconds_between_eval:
+                    last_log_time = time.time()
+                    self.evaluate()
+
+        wandb.finish()
+
+
+# Arguments for MNIST
+args = DCGANArgs(
+    dataset="MNIST",
+    hidden_channels=[32, 64],
+    epochs=15,
+    batch_size=32,
+    seconds_between_eval=20,
+)
+trainer = DCGANTrainer(args)
+trainer.train()
+
+# Arguments for CelebA
+args = DCGANArgs(
+    dataset="CELEB",
+    hidden_channels=[128, 256, 512],
+    batch_size=8,
+    epochs=3,
+    seconds_between_eval=30,
+)
+trainer = DCGANTrainer(args)
+trainer.train()
+# %%

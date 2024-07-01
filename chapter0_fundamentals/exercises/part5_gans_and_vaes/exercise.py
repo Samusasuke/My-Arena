@@ -209,7 +209,7 @@ class DiscriminatorBlock(nn.Module):
         self.conv = Conv2d(in_channels, out_channels, 4, 2, 1)
         if self.with_batchnorm:
             self.batchnorm = nn.BatchNorm2d(out_channels)
-        self.activ = LeakyReLU(0.01)
+        self.activ = LeakyReLU(0.2)
 
     def forward(self, x: t.Tensor):
         x = self.conv(x)
@@ -400,7 +400,7 @@ class DCGANArgs():
     dataset: Literal["MNIST", "CELEB"] = "CELEB"
     batch_size: int = 64
     epochs: int = 3
-    lr: float = 0.0002
+    lr: float = 0.0001
     betas: Tuple[float] = (0.5, 0.999)
     seconds_between_eval: int = 10
     wandb_project: Optional[str] = 'day5-gan'
@@ -425,7 +425,7 @@ class DCGANTrainer:
         ).to(device).train()
 
         self.optG = t.optim.Adam(self.model.netG.parameters(), lr=args.lr, betas=args.betas)
-        self.optD = t.optim.Adam(self.model.netD.parameters(), lr=args.lr, betas=args.betas)
+        self.optD = t.optim.SGD(self.model.netD.parameters(), lr=args.lr)
 
 
     def training_step_discriminator(self, img_real: t.Tensor, img_fake: t.Tensor) -> t.Tensor:
@@ -436,7 +436,7 @@ class DCGANTrainer:
         self.optD.zero_grad()
         D_x = self.model.netD(img_real)
         D_G_z = self.model.netD(img_fake)
-        loss = t.log(D_x) + t.log(1-D_G_z)
+        loss = (t.log(D_x) + t.log(1-D_G_z)).mean()
         loss.backward()
         self.optD.step()
         return loss
@@ -447,7 +447,7 @@ class DCGANTrainer:
         '''
         self.optG.zero_grad()
         D_G_z = self.model.netD(img_fake)
-        loss = t.log(D_G_z)
+        loss = t.log(D_G_z).mean()
         loss.backward()
         self.optG.step()
         return loss
@@ -458,11 +458,11 @@ class DCGANTrainer:
         Performs evaluation by generating 8 instances of random noise and passing them through
         the generator, then logging the results to Weights & Biases.
         '''
-        noise = t.randn(8, self.args.latent_dim_size)
+        noise = t.randn(8, self.args.latent_dim_size).to(device)
         self.model.netG.eval()
         fake_images = self.model.netG(noise)
         self.model.netG.train()
-        images = [wandb.image(img) for img in fake_images]
+        images = [wandb.Image(img) for img in fake_images]
         wandb.log({'images':images},step= self.step)
 
 
@@ -482,7 +482,7 @@ class DCGANTrainer:
             for (img_real, label) in progress_bar:
 
                 # Generate random noise & fake image
-                noise = t.randn(self.args.batch_size, self.args.latent_dim_size).to(device)
+                noise = (t.randn(self.args.batch_size, self.args.latent_dim_size)).to(device)
                 img_real = img_real.to(device)
                 img_fake = self.model.netG(noise)
 
@@ -510,20 +510,21 @@ args = DCGANArgs(
     dataset="MNIST",
     hidden_channels=[32, 64],
     epochs=15,
-    batch_size=32,
+    batch_size=128,
     seconds_between_eval=20,
 )
 trainer = DCGANTrainer(args)
 trainer.train()
 
-# Arguments for CelebA
-args = DCGANArgs(
-    dataset="CELEB",
-    hidden_channels=[128, 256, 512],
-    batch_size=8,
-    epochs=3,
-    seconds_between_eval=30,
-)
-trainer = DCGANTrainer(args)
-trainer.train()
+# # Arguments for CelebA
+# args = DCGANArgs(
+#     dataset="CELEB",
+#     hidden_channels=[128, 256, 512],
+#     batch_size=8,
+#     epochs=3,
+#     seconds_between_eval=30,
+# )
+# trainer = DCGANTrainer(args)
+# trainer.train()
+
 # %%

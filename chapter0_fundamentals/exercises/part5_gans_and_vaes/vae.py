@@ -245,11 +245,11 @@ class AutoencoderTrainer:
                     self.evaluate()
 
         wandb.finish()
+#%%
 
-
-args = AutoencoderArgs()
-trainer = AutoencoderTrainer(args)
-trainer.train()
+# args = AutoencoderArgs()
+# trainer = AutoencoderTrainer(args)
+# trainer.train()
 # %%
 
 @t.inference_mode()
@@ -288,8 +288,9 @@ def visualise_output(
         yaxis=dict(title_text="dim2", tickmode="array", tickvals=list(range(14, 14+28*n_points, 28)), ticktext=[f"{i:.2f}" for i in x])
     ).show()
 
+#%%
 
-visualise_output(trainer.model)
+# visualise_output(trainer.model)
 # %%
 
 @t.inference_mode()
@@ -329,8 +330,138 @@ def visualise_input(
             sizex=data_range/15, sizey=data_range/15,
         )
     fig.show()
+# #%%
 
+# small_dataset = Subset(get_dataset("MNIST"), indices=range(0, 5000))    
+# visualise_input(trainer.model, small_dataset)
+# %%
+
+class VAE(nn.Module):
+    encoder: nn.Module
+    decoder: nn.Module
+
+    def __init__(self, latent_dim_size: int, hidden_dim_size: int):
+        super().__init__()
+        self.hidden_dim_size = hidden_dim_size
+        self.latent_dim_size = latent_dim_size
+
+        
+        self.encoder = Encoder(2*latent_dim_size, hidden_dim_size)
+
+        self.decoder = Decoder(latent_dim_size, hidden_dim_size)
+
+    def sample_latent_vector(self, x: t.Tensor) -> Tuple[t.Tensor, t.Tensor, t.Tensor]:
+        '''
+        Passes `x` through the encoder. Returns the mean and log std dev of the latent vector,
+        as well as the latent vector itself. This function can be used in `forward`, but also
+        used on its own to generate samples for evaluation.
+        '''
+        x = self.encoder(x)
+        mu = x[...,:self.latent_dim_size]
+
+        logsigma = x[...,self.latent_dim_size:]
+        var = t.randn_like(logsigma) * logsigma.exp()
+        print( mu.shape, var.shape)
+        z = mu + var
+        return (z, mu, logsigma)
+
+    def forward(self, x: t.Tensor) -> Tuple[t.Tensor, t.Tensor, t.Tensor]:
+        '''
+        Passes `x` through the encoder and decoder. Returns the reconstructed input, as well
+        as mu and logsigma.
+        '''
+        z, mu, logsigma = self.sample_latent_vector(x)
+        x_prime = self.decoder(z)
+        return (x_prime, mu, logsigma)
+# %%
+
+model = VAE(latent_dim_size=5, hidden_dim_size=100)
+
+trainset_mnist = get_dataset("MNIST")
+x = next(iter(DataLoader(trainset_mnist, batch_size=8)))[0]
+x_prime = model(x)
+print(torchinfo.summary(model, input_data=x))
+# %%
+
+@dataclass
+class VAEArgs(AutoencoderArgs):
+    wandb_project: Optional[str] = 'day5-vae-mnist'
+    beta_kl: float = 0.1
+
+
+class VAETrainer:
+    def __init__(self, args: VAEArgs):
+        self.args = args
+        self.trainset = get_dataset(args.dataset)
+        self.trainloader = DataLoader(self.trainset, batch_size=args.batch_size, shuffle=True)
+        self.model = VAE(
+            latent_dim_size = args.latent_dim_size,
+            hidden_dim_size = args.hidden_dim_size,
+        ).to(device)
+        self.optimizer = t.optim.Adam(self.model.parameters(), lr=args.lr, betas=args.betas)
+
+    def training_step(self, img: t.Tensor) -> t.Tensor:
+        '''
+        Performs a training step on the batch of images in `img`. Returns the loss.
+        '''
+        y, mu, logsigma = self.model(img)
+        loss_a = (y - img).square().mean()
+        loss_b = (mu.square().mean() + (2*logsigma).exp().mean() -1 )/2 -logsigma.mean()
+        loss = loss_a + self.args.beta_kl * loss_b
+        loss.backward()
+        self.optimizer.step()
+        self.optimizer.zero_grad()
+        return loss.item()
+
+
+    @t.inference_mode()
+    def evaluate(self) -> None:
+        '''
+        Evaluates model on holdout data, logs to weights & biases.
+        '''
+        y,_,_ = self.model(HOLDOUT_DATA)
+        arrays = y.cpu().numpy()
+        wandb.log({"images": [wandb.Image(arr) for arr in arrays]}, step=self.step)
+
+    def train(self) -> None:
+        '''
+        Performs a full training run, logging to wandb.
+        '''
+        self.step = 0
+        last_log_time = time.time()
+        wandb.init(project=self.args.wandb_project, name=self.args.wandb_name)
+        wandb.watch(self.model)
+
+        for epoch in range(self.args.epochs):
+
+            progress_bar = tqdm(self.trainloader, total=int(len(self.trainloader)))
+
+            for i, (img, label) in enumerate(progress_bar): # remember that label is not used
+
+                img = img.to(device)
+                loss = self.training_step(img)
+                wandb.log(dict(loss=loss), step=self.step)
+
+                # Update progress bar
+                self.step += img.shape[0]
+                progress_bar.set_description(f"{epoch=}, {loss=:.4f}, examples_seen={self.step}")
+
+                # Evaluate model on the same holdout data
+                if time.time() - last_log_time > self.args.seconds_between_eval:
+                    last_log_time = time.time()
+                    self.evaluate()
+
+        wandb.finish()
+
+
+args = VAEArgs(latent_dim_size=5, hidden_dim_size=100)
+trainer = VAETrainer(args)
+trainer.train()
+
+# %%
 
 small_dataset = Subset(get_dataset("MNIST"), indices=range(0, 5000))    
 visualise_input(trainer.model, small_dataset)
+# %%
+visualise_output(trainer.model)
 # %%

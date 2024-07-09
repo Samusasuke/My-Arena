@@ -179,7 +179,7 @@ class AutoencoderArgs():
     batch_size: int = 512
     epochs: int = 10
     lr: float = 1e-3
-    betas: Tuple[float] = (0.8, 0.999)
+    betas: Tuple[float] = (0.9, 0.999)
     seconds_between_eval: int = 5
     wandb_project: Optional[str] = 'day5-ae-mnist'
     wandb_name: Optional[str] = None
@@ -386,7 +386,7 @@ print(torchinfo.summary(model, input_data=x))
 @dataclass
 class VAEArgs(AutoencoderArgs):
     wandb_project: Optional[str] = 'day5-vae-mnist'
-    beta_kl: float = 0.1
+    beta_kl: float = 0.05
 
 
 class VAETrainer:
@@ -454,7 +454,7 @@ class VAETrainer:
         wandb.finish()
 
 
-args = VAEArgs(latent_dim_size=5, hidden_dim_size=100)
+args = VAEArgs(latent_dim_size=5, hidden_dim_size=100,batch_size = 2048, lr = 1e-3, seconds_between_eval= 20, epochs = 50)
 trainer = VAETrainer(args)
 trainer.train()
 

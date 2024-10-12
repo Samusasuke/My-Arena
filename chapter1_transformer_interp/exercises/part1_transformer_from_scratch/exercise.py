@@ -610,20 +610,51 @@ class TransformerSampler:
         num_return_sequences: int, 
         num_beams: int, 
         max_new_tokens: int, 
-        no_repeat_ngram_size: int = 0,
+        no_repeat_ngram_size: int | None = None,
         verbose=False
     ) -> list[tuple[float, Tensor]]:
         '''
-        Returns a string of autoregressively generated text, starting from the prompt.
+        Implements a beam search, by repeatedly performing the `generate` and `filter` steps (starting
+        from the initial prompt) until either of the two stopping criteria are met:
 
-        Sampling terminates at max_tokens_generated, or when the model generates an
-        end-of-sequence token.
+            (1) we've generated `max_new_tokens` tokens, or
+            (2) we've generated `num_returns_sequences` terminating sequences.
 
-        kwargs are passed to sample_next_token, to give detailed instructions on how 
-        new tokens are chosen.
+        To modularize this function, most of the actual complexity is in the Beams class,
+        in the `generate` and `filter` methods.
         '''
-        # YOUR CODE HERE!
-        raise NotImplementedError()
+
+        assert num_return_sequences <= num_beams
+        self.model.eval()
+
+        # SOLUTION
+        tokens = self.tokenizer.encode(prompt, return_tensors="pt").to(device)
+
+        # list for final beams to return (and early terminations)
+        final_logprobs_and_completions: list[tuple[float, str]] = []
+        # Keep track of all best beams after each step
+        best_beams = Beams(self.model, self.tokenizer, t.tensor([0.0]).to(device), tokens)
+
+        for n in tqdm(range(max_new_tokens)):
+
+            # Generation step
+            best_beams = best_beams.generate(toks_per_beam=num_beams, no_repeat_ngram_size=no_repeat_ngram_size)
+
+            # Filtering step
+            best_beams, best_beams_terminated = best_beams.filter(num_beams=num_beams)
+            final_logprobs_and_completions.extend(best_beams_terminated.logprobs_and_completions)
+
+            # Print output
+            if verbose:
+                best_beams.print()
+
+            # Check stopping condition
+            if len(final_logprobs_and_completions) >= num_return_sequences:
+                return final_logprobs_and_completions[:num_return_sequences]
+
+        final_logprobs_and_completions.extend(best_beams.logprobs_and_completions)
+        final_logprobs_and_completions = final_logprobs_and_completions[:num_return_sequences]
+        return final_logprobs_and_completions
 
 
     @staticmethod
@@ -878,7 +909,47 @@ class Beams:
             (logprob_sum.item(), self.tokenizer.decode(tokens))
             for (logprob_sum, tokens) in zip(self.logprob_sums, self.tokens)
         ]
+    def get_topk_non_repeating(
+        self,
+        logprobs: Float[Tensor, "batch d_vocab"], 
+        no_repeat_ngram_size: int | None,
+        k: int, 
+    ) -> tuple[Float[Tensor, "k"], Int[Tensor, "k"]]:
+        '''
+        logprobs: 
+            tensor of the log-probs for the next token
+        no_repeat_ngram_size:
+            size of ngram to avoid repeating
+        k:
+            number of top logits to return, for each beam in our collection
 
+        Returns:
+            equivalent to the output of `logprobs.topk(dim=-1)`, but makes sure
+            that no returned tokens would produce an ngram of size  `no_repeat_ngram_size`
+            which has already appeared in `self.tokens`.
+        '''
+        batch, seq_len = self.tokens.shape
+        neg_inf = t.tensor(-1.0e4).to(device)
+
+        # If completion isn't long enough for a repetition, or we have no restructions, just return topk
+        if (no_repeat_ngram_size is not None) and (seq_len > no_repeat_ngram_size-1):
+            # Otherwise, we need to check for ngram repetitions
+            # First, get the most recent `no_repeat_ngram_size-1` tokens
+            last_ngram_prefix = self.tokens[:, seq_len - (no_repeat_ngram_size-1):]
+            # Next, find all the tokens we're not allowed to generate (by going iterating through past ngrams and seeing if those ngram prefixes match the last one)
+            for i in range(seq_len - (no_repeat_ngram_size-1)):
+                ngrams = self.tokens[:, i:i+no_repeat_ngram_size] # (batch, ngram)
+                ngrams_are_repeated = (ngrams[:, :-1] == last_ngram_prefix).all(-1) # (batch,)
+                ngram_end_tokens = ngrams[:, [-1]] # (batch, 1)
+                # Fill logprobs with neginf wherever the ngrams are repeated
+                logprobs[range(batch), ngram_end_tokens] = t.where(
+                    ngrams_are_repeated,
+                    neg_inf,
+                    logprobs[range(batch), ngram_end_tokens],
+            )
+
+        # Finally, get our actual tokens
+        return logprobs.topk(k=k, dim=-1)
 
     def generate(self, toks_per_beam: int, no_repeat_ngram_size: int | None = None) -> "Beams":
         '''
@@ -889,8 +960,28 @@ class Beams:
         Optional argument `no_repeat_ngram_size` means your model won't generate any sequences with
         a repeating n-gram of this length.
         '''
-        pass
 
+        tokens = self.tokens
+        sums = self.logprob_sums
+        batch, n = tokens.shape
+        x = self.tokens
+        y = model(x)
+        logprobs = (y[:,-1,:]).log_softmax(dim = -1) # batch d_vocab
+        log_ps, tok_ids = self.get_topk_non_repeating(logprobs, no_repeat_ngram_size= no_repeat_ngram_size, k = toks_per_beam) #batch toks_per_beam 
+
+        t_ans = t.zeros((batch, n+1, toks_per_beam), device = device).int()
+        t_ans[:,:-1,:] = tokens[:,:,None]
+        t_ans[:,-1,:] = tok_ids
+
+        s_ans = t.zeros((batch, toks_per_beam), device = device)
+        s_ans = s_ans + sums[:,None]
+        s_ans = s_ans + log_ps
+
+        t_ans =  einops.rearrange(t_ans, 'batch seq_plus_one k -> (batch k) seq_plus_one ')
+        s_ans = einops.rearrange(s_ans, 'batch k -> (batch k)')
+        # print(t_ans.shape, s_ans.shape)
+
+        return self.new_beams(s_ans, t_ans)
     def filter(self, num_beams: int) -> tuple["Beams", "Beams"]:
         '''
         Returns:
@@ -901,7 +992,18 @@ class Beams:
                 filtered version of self, containing all best `num_beams` which are also terminated.
                 i.e. the sum of lengths of these two should equal `num_beams`.
         '''
-        pass
+    
+        sums, idxs = t.topk(self.logprob_sums, k = num_beams) # k
+        tokens = self.tokens[idxs]
+        finished = tokens[:,-1]==t.tensor([self.tokenizer.eos_token_id],device = device) #batch 
+        # print(finished)
+        sum_a = sums[finished]
+        toks_a = tokens[finished]
+        sum_b = sums[~finished]
+        toks_b = tokens[~finished]
+        
+
+        return self.new_beams(sum_b, toks_b), self.new_beams(sum_a,toks_a)
 
     def print(self, title="Best completions", max_print_chars=80) -> None:
         '''
@@ -918,28 +1020,82 @@ class Beams:
         rprint(table)
 
 
-@t.inference_mode()
-def beam_search(
-    self: TransformerSampler,
-    prompt: str, 
-    num_return_sequences: int, 
-    num_beams: int, 
-    max_new_tokens: int, 
-    no_repeat_ngram_size: int | None = None,
+
+
+#%%
+beams = Beams(
+    model, 
+    tokenizer,
+    logprob_sums = t.tensor([-10.0, -15.0, -20.0]).to(device),
+    tokens = t.tensor([
+        [5661, 318, 262, 2368],
+        [5661, 318, 262, 1218],
+        [5661, 318, 262, 717],
+    ]).to(device)
+)
+
+beams.print()
+#%%
+print("Testing generate, without no_repeat_ngram_size argument:")
+new_beams = beams.generate(toks_per_beam=2)
+new_beams.print()
+assert new_beams.logprobs_and_completions[0][1] == "this is the third time"
+
+print("Testing generate, with no_repeat_ngram_size argument:")
+bigram_beams = Beams(
+    model, 
+    tokenizer,
+    logprob_sums = t.tensor([-0.0]).to(device),
+    tokens = t.tensor([[530, 734, 530, 734]]).to(device)
+    # tokens are " one two one two"
+)
+
+# With no_repeat_ngram_size=1, should not generate the token " one" or " two"
+new_bigram_beams = bigram_beams.generate(toks_per_beam=3, no_repeat_ngram_size=1)
+new_bigram_beams.print()
+assert all([not (completion[1].endswith(" one") or completion[1].endswith(" two")) for completion in new_bigram_beams.logprobs_and_completions])
+
+# With no_repeat_ngram_size=2, it can generate " two" (which it should), but not " one"
+new_bigram_beams = bigram_beams.generate(toks_per_beam=3, no_repeat_ngram_size=2)
+new_bigram_beams.print()
+assert all([not completion[1].endswith(" one") for completion in new_bigram_beams.logprobs_and_completions])
+assert any([not completion[1].endswith(" two") for completion in new_bigram_beams.logprobs_and_completions])
+
+print("All tests for `generate` passed!")
+# %%
+logprob_sums = t.tensor([-1.0, -2.0]).to(device)
+tokens = t.tensor([
+    [19485, 13],
+    [19485, tokenizer.eos_token_id]
+]).to(device)
+
+beams_with_eos = Beams(model, tokenizer, logprob_sums, tokens)
+best_beams, early_terminations = beams_with_eos.filter(2)
+
+t.testing.assert_close(best_beams.logprob_sums, logprob_sums[[0]])
+t.testing.assert_close(best_beams.tokens, tokens[[0]])
+
+assert early_terminations.logprobs_and_completions == [(-2.0, "Stop" + tokenizer.eos_token)]
+
+print("All tests for `filter` passed!")
+# %%
+sampler = TransformerSampler(model, tokenizer)
+
+prompt = "The ships hung in the sky in much the same way that"
+orig_len = len(tokenizer.encode(prompt))
+
+final_logitsums_and_completions = sampler.beam_search(
+    prompt=prompt, 
+    num_return_sequences=3,
+    num_beams=40,
+    max_new_tokens=60, 
+    no_repeat_ngram_size=2,
     verbose=False
-) -> list[tuple[float, Tensor]]:
-    '''
-    Implements a beam search, by repeatedly performing the `generate` and `filter` steps (starting
-    from the initial prompt) until either of the two stopping criteria are met:
+)
 
-        (1) we've generated `max_new_tokens` tokens, or
-        (2) we've generated `num_returns_sequences` terminating sequences.
-
-    To modularize this function, most of the actual complexity is in the Beams class,
-    in the `generate` and `filter` methods.
-    '''
-
-    assert num_return_sequences <= num_beams
-    self.model.eval()
-
-    pass
+# Print all the best output
+for logprob_sum, text in final_logitsums_and_completions:
+    avg_logprob_as_prob = t.tensor(logprob_sum / (len(tokenizer.encode(text)) - orig_len)).exp().item()
+    print("=" * 25 + f" Avg logprob (as probability) = {avg_logprob_as_prob:.3f} " + "=" * 25)
+    rprint("Best output:\n\n[bold dark_orange]" + text)
+# %%

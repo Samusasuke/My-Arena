@@ -47,4 +47,13 @@ then
 else
     echo "VSCode command 'code' not found. Please ensure VSCode is installed and the 'code' command is available in your PATH."
 fi
+
+git config --global user.name "samusasuke"
+git config --global user.email "samuelprietolima@gmail.com"
+
+if [ -f ./.secrets ]; then
+    source ./secrets
+    wandb login --relogin
+fi
+
 echo "Setup complete. The Python virtual environment 'ArenaEnv' is ready to use."

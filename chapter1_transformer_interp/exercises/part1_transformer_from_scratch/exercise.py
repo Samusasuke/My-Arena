@@ -12,6 +12,7 @@ import numpy as np
 import torch as t
 import torch.nn as nn
 import wandb
+import json
 from IPython.display import display
 from jaxtyping import Float, Int
 from rich import print as rprint
@@ -445,7 +446,7 @@ model = DemoTransformer(model_cfg)
 class TransformerTrainingArgs():
     batch_size = 16
     epochs = 10
-    max_steps_per_epoch = 200
+    max_steps_per_epoch : int = 200
     lr = 1e-3
     weight_decay = 1e-2
     wandb_project: str | None = "day1-demotransformer"
@@ -491,7 +492,7 @@ class TransformerTrainer:
         loss = -log_probs.mean()
         loss.backward()
         self.optimizer.step()
-        model.zero_grad()
+        self.optimizer.zero_grad()
         self.step+=1
         return loss.item()
 
@@ -504,7 +505,8 @@ class TransformerTrainer:
         tokens = batch['tokens'].to(device)
         with t.no_grad():
             logits = model(tokens) # batch, seq,  vocab
-            best = logits[...,:-1].argmax(dim = -1)
+            best = logits.argmax(dim = -1)[...,:-1]
+        
             y = tokens[...,1:]
             correct = (best == y)
             
@@ -515,23 +517,25 @@ class TransformerTrainer:
         Trains the model, for `self.args.epochs` epochs. Also handles wandb initialisation, and early stopping
         for each epoch at `self.args.max_steps_per_epoch` steps.
         '''
-        # wandb.init(project = self.args.wandb_project, name = self.args.wandb_name)
+        wandb.init(project = self.args.wandb_project, name = self.args.wandb_name)
         train_loader = self.train_loader()
         test_loader = self.test_loader()
         for _ in range(self.args.epochs):
 
             first_step = self.step
             for batch in train_loader:
-                batch_loss = self.trainin_step(batch)
-                # wandb.log({'batch_loss':batch_loss}, step =self.step)
+                batch_loss = self.training_step(batch)
+                wandb.log({'batch_loss':batch_loss}, step =self.step)
                 if self.step-first_step>args.max_steps_per_epoch:
                     break
                 
-            epoch_acc  = t.cat([self.validation_step(batch) for batch in test_loader]).to(int).mean().item()
+            epoch_acc  = t.cat([self.validation_step(batch) for batch in test_loader]).float().mean().item()
+            print(epoch_acc)
 
-            ## wandb.log({'epoch_acc':epoch_acc}, step = self.step)
+
+            wandb.log({'epoch_acc':epoch_acc}, step = self.step)
         
-        # wandb.finish()
+        wandb.finish()
 
     def train_loader(self) -> DataLoader:
         '''Returns train loader (as in code above).'''
@@ -543,7 +547,23 @@ class TransformerTrainer:
         return DataLoader(dataset_dict["test"], batch_size=self.args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
 # %%
 model = DemoTransformer(model_cfg).to(device)
-args = TransformerTrainingArgs()
+args = TransformerTrainingArgs(max_steps_per_epoch = 1000)
 trainer = TransformerTrainer(args, model)
 trainer.train()
+# %%
+d_vocab = model.cfg.d_vocab
+
+print(f"d_vocab = {d_vocab}")
+print(f"Cross entropy loss on uniform distribution = {math.log(d_vocab)}")
+# %%
+toks = tokenized_dataset[:]["tokens"].flatten()
+
+d_vocab = model.cfg.d_vocab
+freqs = t.bincount(toks, minlength=d_vocab)
+probs = freqs.float() / freqs.sum()
+
+distn = t.distributions.categorical.Categorical(probs=probs)
+entropy = distn.entropy()
+
+print(f"Entropy of training data = {entropy}")
 # %%

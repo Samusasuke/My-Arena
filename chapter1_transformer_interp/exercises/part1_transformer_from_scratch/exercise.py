@@ -529,7 +529,7 @@ class TransformerTrainer:
                 
             epoch_acc  = t.cat([self.validation_step(batch) for batch in test_loader]).to(int).mean().item()
 
-            # wandb.log({'epoch_acc':epoch_acc}, step = self.step)
+            ## wandb.log({'epoch_acc':epoch_acc}, step = self.step)
         
         # wandb.finish()
 
